@@ -396,8 +396,6 @@ type = "{platform}"
 name = "PLACEHOLDER_SERVERNAME"
 jar_out = "server.jar"
 keep_versioned_jar = true
-default_targets = ["viaversion", "geyser", "floodgate"]
-
 [server.jvm]
 xmx = "1024M"
 xms = "1024M"
@@ -460,6 +458,7 @@ def _patch_top_level_mc_version(text: str, mc_version: str) -> str:
   return text
 
 def _patch_server_table(text: str, platform: str) -> str:
+  # line-based patch: only modify [server].type, do not touch [targets.*]
   lines = text.splitlines(True)
   out: List[str] = []
   i = 0
@@ -469,21 +468,16 @@ def _patch_server_table(text: str, platform: str) -> str:
       out.append(line)
       i += 1
       saw_type = False
-      saw_default = False
       while i < len(lines) and not lines[i].lstrip().startswith("["):
         l = lines[i]
-        if re.match(r'^\s*type\s*=', l):
+        if re.match(r"^\s*type\s*=", l):
           out.append(f'type = "{platform}"\n')
           saw_type = True
         else:
-          if re.match(r'^\s*default_targets\s*=', l):
-            saw_default = True
           out.append(l)
         i += 1
       if not saw_type:
         out.append(f'type = "{platform}"\n')
-      if not saw_default:
-        out.append('default_targets = ["viaversion", "geyser", "floodgate"]\n')
       continue
     out.append(line)
     i += 1
@@ -587,20 +581,11 @@ def get_targets(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
   t = cfg.get("targets", {})
   return t if isinstance(t, dict) else {}
 
-def get_default_targets(cfg: Dict[str, Any]) -> List[str]:
-  arr = get_server(cfg).get("default_targets", [])
-  if not isinstance(arr, list):
-    return []
-  return [str(x).strip() for x in arr if isinstance(x, str) and x.strip()]
-
 def select_targets(cfg: Dict[str, Any]) -> List[str]:
+  # install/update targets that are PRESENT in [targets.*] (commented-out = absent)
   tmap = get_targets(cfg)
-  out: List[str] = []
-  for n in get_default_targets(cfg):
-    td = tmap.get(n)
-    if isinstance(td, dict) and bool(td.get("enabled", True)):
-      out.append(n)
-  return out
+  names = [k for k, v in tmap.items() if isinstance(k, str) and isinstance(v, dict)]
+  return sorted(set(names))
 
 def get_jvm_args(cfg: Dict[str, Any]) -> Tuple[str, str]:
   jvm = get_server(cfg).get("jvm", {})
