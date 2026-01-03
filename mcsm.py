@@ -870,6 +870,103 @@ def cmd_rmsrv(cfg: Dict[str, Any], dest_dir: str) -> int:
     warn(f"Not found: {path}")
   return 0
 
+
+# =========================================================
+# Status (offline, uses state.toml only)
+# =========================================================
+def _status_line(label: str, ok_flag: bool, detail: str = "") -> str:
+  s = "OK" if ok_flag else "NG"
+  if detail:
+    return f"{label}: {s} ({detail})"
+  return f"{label}: {s}"
+
+def cmd_status(config_path: str) -> int:
+  if not os.path.exists(config_path):
+    raise SystemExit(f"ERROR: config not found: {config_path}")
+  cfg = load_toml(config_path)
+  dest_dir = get_dest_dir(cfg, config_path)
+  spath = state_path(dest_dir)
+  if not os.path.exists(spath):
+    raise SystemExit("ERROR: state.toml not found. Run install first.")
+  st = load_toml(spath)
+
+  installed = st.get("installed", {})
+  ins_server = installed.get("server", {}) if isinstance(installed, dict) else {}
+  ins_targets = installed.get("targets", {}) if isinstance(installed, dict) else {}
+
+  print(f"SERVER_DIR: {dest_dir}")
+  print(f"STATE     : {spath}")
+  print("")
+
+  # --- server ---
+  print("Server:")
+  if not isinstance(ins_server, dict):
+    print("  (invalid state.toml)")
+  else:
+    platform = str(ins_server.get("type", "")).strip() or "(unknown)"
+    mc_ver = str(ins_server.get("mc_version", "")).strip() or "(unknown)"
+    server_ver = str(ins_server.get("server_version", "")).strip() or "(unknown)"
+    jar_path = str(ins_server.get("jar_path", "server.jar")).strip() or "server.jar"
+    sha_expect = str(ins_server.get("sha256", "")).strip()
+
+    jar_abs = os.path.join(dest_dir, jar_path) if not os.path.isabs(jar_path) else jar_path
+    exists = os.path.exists(jar_abs)
+
+    status = "OK"
+    detail = ""
+    if not exists:
+      status = "MISSING"
+    else:
+      if sha_expect:
+        sha_now = sha256_file(jar_abs)
+        if sha_now != sha_expect:
+          status = "MODIFIED"
+          detail = "hash mismatch"
+      else:
+        status = "UNKNOWN"
+        detail = "no hash in state"
+    print(f"  {platform} {mc_ver} {server_ver}")
+    print(f"  file   : {jar_path}")
+    if detail:
+      print(f"  status : {status} ({detail})")
+    else:
+      print(f"  status : {status}")
+    installed_at = str(ins_server.get("installed_at", "")).strip()
+    if installed_at:
+      print(f"  at     : {installed_at}")
+
+  print("")
+  print("Plugins:")
+  if not isinstance(ins_targets, dict) or not ins_targets:
+    print("  (none)")
+    return 0
+
+  # stable order: by key
+  keys = sorted([k for k in ins_targets.keys() if isinstance(k, str)])
+  for name in keys:
+    it = ins_targets.get(name, {})
+    if not isinstance(it, dict):
+      continue
+    v = str(it.get("resolved_version", "")).strip() or "(unknown)"
+    out_rel = str(it.get("out", "")).strip()
+    sha_expect = str(it.get("sha256", "")).strip()
+    if not out_rel:
+      print(f"  {name:<12} {v:<12} INVALID (no out)")
+      continue
+    out_abs = os.path.join(dest_dir, out_rel) if not os.path.isabs(out_rel) else out_rel
+    if not os.path.exists(out_abs):
+      print(f"  {name:<12} {v:<12} MISSING")
+      continue
+    if sha_expect:
+      sha_now = sha256_file(out_abs)
+      if sha_now != sha_expect:
+        print(f"  {name:<12} {v:<12} MODIFIED")
+      else:
+        print(f"  {name:<12} {v:<12} OK")
+    else:
+      print(f"  {name:<12} {v:<12} UNKNOWN")
+  return 0
+
 # =========================================================
 # Commands: init/list/install/update (core)
 # =========================================================
@@ -1089,6 +1186,8 @@ def build_argparser() -> argparse.ArgumentParser:
   p_init.add_argument("platform", choices=["purpur", "paper"])
   p_init.add_argument("--force", action="store_true", help="overwrite if exists")
 
+  cmd.add_parser("status", help="show installed server/plugins status from state.toml (offline)")
+
   cmd.add_parser("setup", help="generate launcher scripts and desktop/startmenu shortcut (OS-specific)")
   cmd.add_parser("addsrv", help="register server as a user service (systemd/launchd/startup)")
   cmd.add_parser("rmsrv", help="remove user service registration")
@@ -1106,6 +1205,8 @@ def main(argv: List[str]) -> int:
     return cmd_install(ns.platform, ns.mc_version, config_path, ns.force_eula_true)
   if ns.cmd == "update":
     return cmd_update(config_path)
+  if ns.cmd == "status":
+    return cmd_status(config_path)
   if ns.cmd == "init":
     return cmd_init(ns.platform, config_path, ns.force)
 

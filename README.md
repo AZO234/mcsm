@@ -44,6 +44,7 @@ You can check and add plugin's interface name of Modrinth API.
 - `init <platform>`
 - `list <platform> [mc_version]`
 - `install <platform> <mc_version>`
+- `status`
 - `update`
 - `setup` / `addsrv` / `rmsrv`
 - `shortcuts list`

@@ -42,10 +42,10 @@ Modrinth APIのインターフェイス名を登録してください。
 - `init <platform>` ： 設定ファイルをテンプレート出力
 - `list <platform> [mc_version]` : 一覧表示
 - `install <platform> <mc_version>` : インストール
+- `status` : 確認
 - `update` : 更新
 - `setup` : サーバをアプリとして登録
 - `addsrv` / `rmsrv` : サーバをサービスとして登録＆削除
-- `shortcuts list`
 
 ## 任意：mcsm をグローバルに配置する方法 🧩
 
