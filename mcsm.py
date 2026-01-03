@@ -8,6 +8,9 @@ from __future__ import annotations
 #   mcsm install <platform> <mc_version> [--force-eula-true]
 #   mcsm update
 #   mcsm init <platform> [--force]
+#   mcsm setup
+#   mcsm addsrv
+#   mcsm rmsrv
 #
 # Notes:
 # - Run mcsm in the server directory (directory that contains mcsm.toml), or pass --config.
@@ -20,6 +23,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import platform as py_platform
 import re
 import shutil
 import subprocess
@@ -42,6 +46,71 @@ try:
   import tomli  # py3.10 (pip)
 except Exception:
   tomli = None  # type: ignore
+
+# =========================================================
+# Templates (MC_SERVER_*_TEMPLATE)
+# =========================================================
+MC_SERVER_SH_TEMPLATE = """#!/bin/sh
+set -eu
+cd "{server_dir}"
+exec java {jvm_args} -jar "{jar}" {extra_args}
+"""
+
+MC_SERVER_COMMAND_TEMPLATE = """#!/bin/bash
+set -eu
+cd "{server_dir}"
+exec java {jvm_args} -jar "{jar}" {extra_args}
+"""
+
+MC_SERVER_BAT_TEMPLATE = r"""@echo off
+setlocal
+cd /d "{server_dir}"
+java {jvm_args} -jar "{jar}" {extra_args}
+endlocal
+"""
+
+MC_SERVER_DESKTOP_TEMPLATE = """[Desktop Entry]
+Type=Application
+Name=MCSERVER {name}
+GenericName=MCSERVER {name}
+Comment=Minecraft Server ({platform} {mc_version})
+Exec={exec_cmd}
+Terminal=true
+Categories=Game;Server;
+"""
+
+SYSTEMD_USER_SERVICE_TEMPLATE = """[Unit]
+Description=MCSERVER {name}
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={server_dir}
+ExecStart=java {jvm_args} -jar {jar} {extra_args}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+
+MAC_LAUNCH_AGENT_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{command_path}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{log_out}</string>
+  <key>StandardErrorPath</key><string>{log_err}</string>
+</dict>
+</plist>
+"""
 
 # =========================================================
 # Minimal TOML writer for state.toml (tool-owned)
@@ -130,11 +199,21 @@ def make_safe_name(s: str) -> str:
   s = re.sub(r"-{2,}", "-", s).strip("-")
   return s or "mcserver"
 
-def run_cmd(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
-  return subprocess.run(args, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
 def config_dir_from_path(config_path: str) -> str:
   return os.path.abspath(os.path.dirname(os.path.abspath(config_path)))
+
+def write_text(path: str, text: str, mode: int | None = None) -> None:
+  ensure_dir(os.path.dirname(path))
+  Path(path).write_text(text, encoding="utf-8")
+  if mode is not None and os.name != "nt":
+    os.chmod(path, mode)
+
+def which(cmd: str) -> Optional[str]:
+  for p in os.environ.get("PATH", "").split(os.pathsep):
+    c = os.path.join(p, cmd)
+    if os.path.isfile(c) and os.access(c, os.X_OK):
+      return c
+  return None
 
 # =========================================================
 # HTTP helpers
@@ -183,7 +262,6 @@ def purpur_latest_build(mc_ver: str, user_agent: str) -> int:
 def purpur_download_url(mc_ver: str) -> str:
   return f"https://api.purpurmc.org/v2/purpur/{mc_ver}/latest/download"
 
-# Paper Fill v3 (preferred)
 def fill_v3_project_versions(project: str, user_agent: str) -> List[str]:
   j = http_get_json(f"https://fill.papermc.io/v3/projects/{project}", user_agent)
   versions_obj = j.get("versions", {})
@@ -227,7 +305,6 @@ def fill_v3_latest_stable_download(project: str, version: str, user_agent: str) 
     raise RuntimeError("Fill v3: download URL missing (server:default)")
   return build_id, url
 
-# Paper API v2 fallback
 def papermc_v2_latest_version(project: str, user_agent: str) -> str:
   j = http_get_json(f"https://api.papermc.io/v2/projects/{project}", user_agent)
   versions = j.get("versions", [])
@@ -383,7 +460,6 @@ def _patch_top_level_mc_version(text: str, mc_version: str) -> str:
   return text
 
 def _patch_server_table(text: str, platform: str) -> str:
-  # line-based patch: only inside [server] ... before next table header
   lines = text.splitlines(True)
   out: List[str] = []
   i = 0
@@ -392,9 +468,8 @@ def _patch_server_table(text: str, platform: str) -> str:
     if line.strip() == "[server]":
       out.append(line)
       i += 1
-      in_server = True
       saw_type = False
-      saw_default_targets = False
+      saw_default = False
       while i < len(lines) and not lines[i].lstrip().startswith("["):
         l = lines[i]
         if re.match(r'^\s*type\s*=', l):
@@ -402,14 +477,12 @@ def _patch_server_table(text: str, platform: str) -> str:
           saw_type = True
         else:
           if re.match(r'^\s*default_targets\s*=', l):
-            saw_default_targets = True
+            saw_default = True
           out.append(l)
         i += 1
       if not saw_type:
-        out.insert(len(out) - 0, f'type = "{platform}"\n')
-      if not saw_default_targets:
-        # insert after type line if possible, else at end of server block
-        # find last inserted position within server block in out
+        out.append(f'type = "{platform}"\n')
+      if not saw_default:
         out.append('default_targets = ["viaversion", "geyser", "floodgate"]\n')
       continue
     out.append(line)
@@ -417,9 +490,9 @@ def _patch_server_table(text: str, platform: str) -> str:
   return "".join(out)
 
 def default_config_text(platform: str, mc_version: str) -> str:
-  txt = template_text(platform)  # already correct TOML
+  txt = template_text(platform)
   txt = _patch_top_level_mc_version(txt, mc_version)
-  txt = _patch_server_table(txt, platform)  # keeps targets intact
+  txt = _patch_server_table(txt, platform)
   return txt
 
 def patch_config_text(path: str, platform: str, mc_version: str) -> None:
@@ -486,30 +559,36 @@ def get_mc_version(cfg: Dict[str, Any]) -> str:
     raise SystemExit("ERROR: mc_version is not set.")
   return v
 
-def get_server_platform(cfg: Dict[str, Any]) -> str:
+def get_server(cfg: Dict[str, Any]) -> Dict[str, Any]:
   s = cfg.get("server", {})
   if not isinstance(s, dict):
     raise SystemExit("ERROR: [server] is required")
-  t = str(s.get("type", "")).strip()
+  return s
+
+def get_server_platform(cfg: Dict[str, Any]) -> str:
+  t = str(get_server(cfg).get("type", "")).strip()
   if t not in ("purpur", "paper"):
     raise SystemExit(f"ERROR: unsupported server.type={t}")
   return t
 
+def get_server_name(cfg: Dict[str, Any], dest_dir: str) -> str:
+  name = str(get_server(cfg).get("name", "")).strip()
+  if not name or "PLACEHOLDER" in name:
+    return os.path.basename(dest_dir.rstrip("/\\")) or "mcserver"
+  return name
+
 def get_server_jar_out(cfg: Dict[str, Any]) -> str:
-  s = cfg.get("server", {})
-  return str(s.get("jar_out", "server.jar")).strip() if isinstance(s, dict) else "server.jar"
+  return str(get_server(cfg).get("jar_out", "server.jar")).strip()
 
 def get_keep_versioned_jar(cfg: Dict[str, Any]) -> bool:
-  s = cfg.get("server", {})
-  return bool(s.get("keep_versioned_jar", True)) if isinstance(s, dict) else True
+  return bool(get_server(cfg).get("keep_versioned_jar", True))
 
 def get_targets(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
   t = cfg.get("targets", {})
   return t if isinstance(t, dict) else {}
 
 def get_default_targets(cfg: Dict[str, Any]) -> List[str]:
-  s = cfg.get("server", {})
-  arr = s.get("default_targets", []) if isinstance(s, dict) else cfg.get("default_targets", [])
+  arr = get_server(cfg).get("default_targets", [])
   if not isinstance(arr, list):
     return []
   return [str(x).strip() for x in arr if isinstance(x, str) and x.strip()]
@@ -522,6 +601,19 @@ def select_targets(cfg: Dict[str, Any]) -> List[str]:
     if isinstance(td, dict) and bool(td.get("enabled", True)):
       out.append(n)
   return out
+
+def get_jvm_args(cfg: Dict[str, Any]) -> Tuple[str, str]:
+  jvm = get_server(cfg).get("jvm", {})
+  if not isinstance(jvm, dict):
+    jvm = {}
+  xmx = str(jvm.get("xmx", "1024M")).strip()
+  xms = str(jvm.get("xms", "1024M")).strip()
+  extra = jvm.get("extra_args", [])
+  if not isinstance(extra, list):
+    extra = []
+  extra_args = " ".join([str(x) for x in extra if str(x).strip()])
+  jvm_args = f"-Xmx{xmx} -Xms{xms}"
+  return jvm_args, extra_args
 
 # =========================================================
 # Resolvers
@@ -567,7 +659,219 @@ def set_eula_true(dest_dir: str) -> None:
   Path(os.path.join(dest_dir, "eula.txt")).write_text("eula=true\n", encoding="utf-8")
 
 # =========================================================
-# Commands
+# Setup/AddSrv/RmSrv backends
+# =========================================================
+def os_family() -> str:
+  if os.name == "nt":
+    return "windows"
+  sysname = py_platform.system().lower()
+  if "darwin" in sysname:
+    return "macos"
+  return "linux"
+
+def server_script_paths(dest_dir: str, name: str) -> Dict[str, str]:
+  safe = make_safe_name(name)
+  return {
+    "linux": os.path.join(dest_dir, "mcserver.sh"),
+    "macos": os.path.join(dest_dir, "mcserver.command"),
+    "windows": os.path.join(dest_dir, "mcserver.bat"),
+    "safe": safe,
+  }
+
+def render_server_scripts(cfg: Dict[str, Any], dest_dir: str) -> Dict[str, str]:
+  name = get_server_name(cfg, dest_dir)
+  plat = get_server_platform(cfg)
+  mc_ver = get_mc_version(cfg)
+  jar = get_server_jar_out(cfg)
+  jvm_args, extra_args = get_jvm_args(cfg)
+  extra_args = extra_args.strip() or "nogui"
+
+  paths = server_script_paths(dest_dir, name)
+
+  sh = MC_SERVER_SH_TEMPLATE.format(server_dir=dest_dir, jvm_args=jvm_args, jar=jar, extra_args=extra_args)
+  command = MC_SERVER_COMMAND_TEMPLATE.format(server_dir=dest_dir, jvm_args=jvm_args, jar=jar, extra_args=extra_args)
+  bat = MC_SERVER_BAT_TEMPLATE.format(server_dir=dest_dir, jvm_args=jvm_args, jar=jar, extra_args=extra_args)
+
+  write_text(paths["linux"], sh, mode=0o755)
+  write_text(paths["macos"], command, mode=0o755)
+  write_text(paths["windows"], bat, mode=None)
+
+  return {"name": name, "platform": plat, "mc_version": mc_ver, **paths}
+
+def linux_setup(cfg: Dict[str, Any], dest_dir: str) -> None:
+  meta = render_server_scripts(cfg, dest_dir)
+  safe = meta["safe"]
+  bin_dir = os.path.expanduser("~/.local/bin")
+  app_dir = os.path.expanduser("~/.local/share/applications")
+  ensure_dir(bin_dir)
+  ensure_dir(app_dir)
+
+  launcher = os.path.join(bin_dir, f"mcserver-{safe}")
+  wrapper = f"""#!/bin/sh
+set -eu
+exec "{meta['linux']}"
+"""
+  write_text(launcher, wrapper, mode=0o755)
+
+  desktop_path = os.path.join(app_dir, f"mcserver-{safe}.desktop")
+  desktop = MC_SERVER_DESKTOP_TEMPLATE.format(
+    name=meta["name"],
+    platform=meta["platform"],
+    mc_version=meta["mc_version"],
+    exec_cmd=launcher,
+  )
+  write_text(desktop_path, desktop, mode=None)
+
+  ok(f"Created: {launcher}")
+  ok(f"Created: {desktop_path}")
+  info("Tip: ensure ~/.local/bin is in PATH.")
+
+def windows_setup(cfg: Dict[str, Any], dest_dir: str) -> None:
+  meta = render_server_scripts(cfg, dest_dir)
+  safe = meta["safe"]
+  appdata = os.environ.get("APPDATA", "")
+  if not appdata:
+    warn("APPDATA not set; setup will only generate mcserver.bat in server dir.")
+    ok(f"Created: {meta['windows']}")
+    return
+  startmenu = os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs")
+  ensure_dir(startmenu)
+  shortcut_bat = os.path.join(startmenu, f"MCSERVER-{safe}.bat")
+  shutil.copy2(meta["windows"], shortcut_bat)
+  ok(f"Created: {shortcut_bat}")
+
+def macos_setup(cfg: Dict[str, Any], dest_dir: str) -> None:
+  meta = render_server_scripts(cfg, dest_dir)
+  safe = meta["safe"]
+  bin_dir = os.path.expanduser("~/.local/bin")
+  ensure_dir(bin_dir)
+  launcher = os.path.join(bin_dir, f"mcserver-{safe}")
+  wrapper = f"""#!/bin/sh
+set -eu
+exec "{meta['macos']}"
+"""
+  write_text(launcher, wrapper, mode=0o755)
+  ok(f"Created: {launcher}")
+  info("You can run it from Terminal. (GUI app bundle is out of scope.)")
+
+def cmd_setup(cfg: Dict[str, Any], dest_dir: str) -> int:
+  step("Generating server launch scripts")
+  fam = os_family()
+  if fam == "linux":
+    linux_setup(cfg, dest_dir)
+  elif fam == "macos":
+    macos_setup(cfg, dest_dir)
+  else:
+    windows_setup(cfg, dest_dir)
+  ok("Setup done.")
+  return 0
+
+def cmd_addsrv(cfg: Dict[str, Any], dest_dir: str) -> int:
+  meta = render_server_scripts(cfg, dest_dir)
+  safe = meta["safe"]
+  fam = os_family()
+  if fam == "linux":
+    service_dir = os.path.expanduser("~/.config/systemd/user")
+    ensure_dir(service_dir)
+    unit_path = os.path.join(service_dir, f"mcserver-{safe}.service")
+    jvm_args, extra_args = get_jvm_args(cfg)
+    extra_args = extra_args.strip() or "nogui"
+    unit = SYSTEMD_USER_SERVICE_TEMPLATE.format(
+      name=meta["name"],
+      server_dir=dest_dir,
+      jvm_args=jvm_args,
+      jar=get_server_jar_out(cfg),
+      extra_args=extra_args,
+    )
+    write_text(unit_path, unit, mode=None)
+    # enable --user if possible
+    if which("systemctl"):
+      subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+      subprocess.run(["systemctl", "--user", "enable", "--now", f"mcserver-{safe}.service"], check=False)
+      ok(f"Installed systemd user service: mcserver-{safe}.service")
+      info("Use: systemctl --user status mcserver-*.service")
+    else:
+      warn("systemctl not found; wrote unit file only.")
+    ok(f"Created: {unit_path}")
+    return 0
+
+  if fam == "macos":
+    agents = os.path.expanduser("~/Library/LaunchAgents")
+    ensure_dir(agents)
+    label = f"com.mcsm.mcserver.{safe}"
+    plist_path = os.path.join(agents, f"{label}.plist")
+    logs = os.path.expanduser("~/Library/Logs")
+    ensure_dir(logs)
+    plist = MAC_LAUNCH_AGENT_PLIST_TEMPLATE.format(
+      label=label,
+      command_path=meta["macos"],
+      log_out=os.path.join(logs, f"{label}.out.log"),
+      log_err=os.path.join(logs, f"{label}.err.log"),
+    )
+    write_text(plist_path, plist, mode=None)
+    if which("launchctl"):
+      subprocess.run(["launchctl", "unload", plist_path], check=False)
+      subprocess.run(["launchctl", "load", plist_path], check=False)
+      ok(f"Loaded LaunchAgent: {label}")
+    else:
+      warn("launchctl not found; wrote plist only.")
+    ok(f"Created: {plist_path}")
+    return 0
+
+  # windows: copy bat to Startup
+  appdata = os.environ.get("APPDATA", "")
+  if not appdata:
+    raise SystemExit("ERROR: APPDATA not set")
+  startup = os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs\Startup")
+  ensure_dir(startup)
+  dst = os.path.join(startup, f"MCSERVER-{safe}.bat")
+  shutil.copy2(meta["windows"], dst)
+  ok(f"Added to Startup: {dst}")
+  return 0
+
+def cmd_rmsrv(cfg: Dict[str, Any], dest_dir: str) -> int:
+  name = get_server_name(cfg, dest_dir)
+  safe = make_safe_name(name)
+  fam = os_family()
+  if fam == "linux":
+    unit = f"mcserver-{safe}.service"
+    unit_path = os.path.expanduser(f"~/.config/systemd/user/{unit}")
+    if which("systemctl"):
+      subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=False)
+      subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    if os.path.exists(unit_path):
+      os.remove(unit_path)
+      ok(f"Removed: {unit_path}")
+    else:
+      warn(f"Not found: {unit_path}")
+    return 0
+
+  if fam == "macos":
+    label = f"com.mcsm.mcserver.{safe}"
+    plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+    if which("launchctl") and os.path.exists(plist_path):
+      subprocess.run(["launchctl", "unload", plist_path], check=False)
+    if os.path.exists(plist_path):
+      os.remove(plist_path)
+      ok(f"Removed: {plist_path}")
+    else:
+      warn(f"Not found: {plist_path}")
+    return 0
+
+  appdata = os.environ.get("APPDATA", "")
+  if not appdata:
+    raise SystemExit("ERROR: APPDATA not set")
+  startup = os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs\Startup")
+  path = os.path.join(startup, f"MCSERVER-{safe}.bat")
+  if os.path.exists(path):
+    os.remove(path)
+    ok(f"Removed: {path}")
+  else:
+    warn(f"Not found: {path}")
+  return 0
+
+# =========================================================
+# Commands: init/list/install/update (core)
 # =========================================================
 def ensure_config_for_install(platform: str, mc_version: str, config_path: str) -> None:
   if os.path.exists(config_path):
@@ -591,7 +895,9 @@ def cmd_list(platform: str, mc_version: Optional[str], config_path: str) -> int:
     ua = get_user_agent(cfg)
 
   if not mc_version:
-    mc_version = purpur_latest_mc_version(ua) if platform == "purpur" else (fill_v3_project_versions("paper", ua)[0] if fill_v3_project_versions("paper", ua) else papermc_v2_latest_version("paper", ua))
+    mc_version = purpur_latest_mc_version(ua) if platform == "purpur" else (
+      fill_v3_project_versions("paper", ua)[0] if fill_v3_project_versions("paper", ua) else papermc_v2_latest_version("paper", ua)
+    )
 
   sp = resolve_server_plan(platform, mc_version, ua)
   print(f"PLATFORM   : {platform}")
@@ -760,7 +1066,7 @@ def cmd_update(config_path: str) -> int:
   return _apply_install_or_update(cfg, config_path, require_state=True, force_eula_true=False)
 
 # =========================================================
-# CLI (command-first): mcsm <command> ...
+# CLI
 # =========================================================
 def build_argparser() -> argparse.ArgumentParser:
   ap = argparse.ArgumentParser(prog="mcsm")
@@ -783,11 +1089,16 @@ def build_argparser() -> argparse.ArgumentParser:
   p_init.add_argument("platform", choices=["purpur", "paper"])
   p_init.add_argument("--force", action="store_true", help="overwrite if exists")
 
+  cmd.add_parser("setup", help="generate launcher scripts and desktop/startmenu shortcut (OS-specific)")
+  cmd.add_parser("addsrv", help="register server as a user service (systemd/launchd/startup)")
+  cmd.add_parser("rmsrv", help="remove user service registration")
+
   return ap
 
 def main(argv: List[str]) -> int:
   ns = build_argparser().parse_args(argv)
   config_path = ns.config
+  cfg = load_toml(config_path) if os.path.exists(config_path) else None
 
   if ns.cmd == "list":
     return cmd_list(ns.platform, ns.mc_version, config_path)
@@ -797,6 +1108,18 @@ def main(argv: List[str]) -> int:
     return cmd_update(config_path)
   if ns.cmd == "init":
     return cmd_init(ns.platform, config_path, ns.force)
+
+  # setup/addsrv/rmsrv need config
+  if cfg is None:
+    raise SystemExit(f"ERROR: config not found: {config_path}")
+  dest_dir = get_dest_dir(cfg, config_path)
+
+  if ns.cmd == "setup":
+    return cmd_setup(cfg, dest_dir)
+  if ns.cmd == "addsrv":
+    return cmd_addsrv(cfg, dest_dir)
+  if ns.cmd == "rmsrv":
+    return cmd_rmsrv(cfg, dest_dir)
 
   raise SystemExit("ERROR: unknown command")
 
